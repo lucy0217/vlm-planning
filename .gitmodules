@@ -1,3 +1,6 @@
 [submodule "third_party/EmbodiedBench"]
 	path = third_party/EmbodiedBench
 	url = git@github.com:lucy0217/EmbodiedBench.git
+[submodule "third_party/transformers"]
+	path = third_party/transformers
+	url = https://github.com/lucy0217/transformers.git
