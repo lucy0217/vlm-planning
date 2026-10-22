@@ -78,9 +78,15 @@ vlm-planning/third_party/transformers/src/transformers/__init__.py
 
 当前已验证的主要版本为 Python 3.11、PyTorch 2.11.0+cu128、Transformers 5.19.0.dev0、Accelerate 1.15.0、FastAPI 0.142.2 和 Uvicorn 0.54.0。Transformers 子模块基线提交为 `bea93d0faf337b048e83b91f5bb436ed135f53b3`。
 
+官方 fine-grained FP8 checkpoint 还依赖 `kernels==0.17.0`。安装依赖后必须重启 FP8 服务；已经启动的 Python 进程不会重新探测该包。本项目已将 `kernels-community/finegrained-fp8` 的 v4 映射固定到验证过的 revision `0e5764aa5c27d0f005117a92645156481540950a`。首次需要联网下载该 revision 的完整 snapshot；缓存完成后，FP8 服务可以使用 `HF_HUB_OFFLINE=1` 完全离线启动。
+
 ## 启动模型服务
 
-先检查 GPU 和端口，再在单独的 tmux 中运行。下面以 GPU 0、端口 8001 为例：
+先检查 GPU 和端口，再在单独的 tmux 中运行。
+
+### BF16 服务
+
+下面以 GPU 0、端口 8001 为例：
 
 ```bash
 tmux new -s vlm-profile
@@ -94,14 +100,39 @@ python inference/server.py \
   --port 8001
 ```
 
-服务只监听 `127.0.0.1`，默认使用 BF16、SDPA 和单请求串行处理。修改服务或 Transformers 源码后需要重启服务。
-
 健康检查：
 
 ```bash
 curl --noproxy '*' -sS http://127.0.0.1:8001/health
 curl --noproxy '*' -sS http://127.0.0.1:8001/v1/models
 ```
+
+### FP8 服务
+
+确认 `kernels==0.17.0` 已安装，且上文固定 revision 的完整
+`kernels-community/finegrained-fp8` snapshot 已缓存。下面在 GPU 1、端口
+8002 上完全离线启动 FP8 服务：
+
+```bash
+tmux new -s vlm-fp8
+conda activate vlm-profile
+cd /data/home/x_long32/workspace/tapeout_2027/vlm-planning
+
+CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 \
+python inference/server.py \
+  --model-path /data/home/x_long32/workspace/models/Qwen3-VL-8B-Instruct-FP8 \
+  --model-name Qwen/Qwen3-VL-8B-Instruct-FP8 \
+  --port 8002
+```
+
+健康检查：
+
+```bash
+curl --noproxy '*' -sS http://127.0.0.1:8002/health
+curl --noproxy '*' -sS http://127.0.0.1:8002/v1/models
+```
+
+服务只监听 `127.0.0.1`，默认使用 BF16 激活、SDPA 和单请求串行处理；FP8 服务的权重仍使用 checkpoint 中的 fine-grained FP8 量化格式。修改服务或 Transformers 源码后需要重启服务。
 
 `transformers_source` 必须指向本项目的 Transformers 子模块。
 
@@ -119,6 +150,14 @@ Smoke 脚本位于 `scripts/smoke/`，用于快速定位环境、模型服务或
 conda activate vlm-profile
 cd /data/home/x_long32/workspace/tapeout_2027/vlm-planning
 python scripts/smoke/vlm_image.py
+```
+
+`--base-url` 和 `--model-name` 可用于检查另一端口上的模型。例如 FP8 服务运行在 8002 时：
+
+```bash
+python scripts/smoke/vlm_image.py \
+  --base-url http://127.0.0.1:8002/v1 \
+  --model-name Qwen/Qwen3-VL-8B-Instruct-FP8
 ```
 
 预期模型识别图片主要颜色为红色，并返回 token 数、结束原因和服务端耗时。
@@ -146,8 +185,14 @@ export OPENAI_API_KEY=EMPTY
 export NO_PROXY=127.0.0.1,localhost
 export no_proxy="$NO_PROXY"
 
-python ../../scripts/smoke/eb_alfred_once.py
+python ../../scripts/smoke/eb_alfred_once.py \
+  --base-url http://127.0.0.1:8001/v1 \
+  --model-name Qwen/Qwen3-VL-8B-Instruct
 ```
+
+检查 FP8 服务时把参数改为 `http://127.0.0.1:8002/v1` 和
+`Qwen/Qwen3-VL-8B-Instruct-FP8`。脚本会按模型名称写入独立的
+`*_transformers_connectivity` 目录，避免覆盖另一模型的报告。
 
 成功时终端会出现 `CONNECTIVITY_SMOKE_PASS`。报告保存在：
 
@@ -157,6 +202,60 @@ Qwen3-VL-8B-Instruct_transformers_connectivity/base/connectivity_report.json
 ```
 
 该脚本只验证一次“环境截图 → 模型推理 → JSON 解析 → 环境动作”的调用链。动作失败不等于服务连接失败，也不代表完整 episode 的成功率。
+
+## 使用本地 Transformers 服务运行 EmbodiedBench 测评
+
+保持上文的 Transformers 模型服务和 Xorg `:1` 运行，然后在另一个 tmux
+窗口中启动测评。下面以 EB-Habitat 的五个子集为例：
+
+```bash
+tmux new -s qwen3_eval
+conda activate embench
+cd /data/home/x_long32/workspace/tapeout_2027/vlm-planning/third_party/EmbodiedBench
+
+export DISPLAY=:1
+export OPENAI_API_KEY=EMPTY
+export NO_PROXY=127.0.0.1,localhost
+export no_proxy="$NO_PROXY"
+```
+
+评测 BF16（或以 `--dtype float16` 启动的 FP16）服务时：
+
+```bash
+export remote_url=http://127.0.0.1:8001/v1
+MODEL_NAME=Qwen/Qwen3-VL-8B-Instruct
+EXP_NAME=transformers_bf16
+
+python -m embodiedbench.main \
+  env=eb-hab \
+  model_name="$MODEL_NAME" \
+  model_type=remote \
+  exp_name="$EXP_NAME" \
+  eval_sets='[common_sense,complex_instruction,spatial_relationship,visual_appearance,long_horizon]'
+```
+
+评测 FP8 服务时使用同一条 EmbodiedBench 命令，只需将服务端口从
+8001 切换到 8002，并使用 FP8 服务在 `/v1/models` 中声明的模型名。
+`EXP_NAME` 仅用于分开两组结果，不会改变测评逻辑：
+
+```bash
+export remote_url=http://127.0.0.1:8002/v1
+MODEL_NAME=Qwen/Qwen3-VL-8B-Instruct-FP8
+EXP_NAME=transformers_fp8
+
+python -m embodiedbench.main \
+  env=eb-hab \
+  model_name="$MODEL_NAME" \
+  model_type=remote \
+  exp_name="$EXP_NAME" \
+  eval_sets='[common_sense,complex_instruction,spatial_relationship,visual_appearance,long_horizon]'
+```
+
+FP8 与 FP16/BF16 使用相同的 EmbodiedBench evaluator、prompt、数据子集和生成参数；
+区别只是请求被发送到不同端口的模型服务。`model_name` 必须与对应服务
+`/v1/models` 返回的 ID 一致，否则本地服务会返回 HTTP 404。如果要测评其他
+EmbodiedBench 环境，只需像常规测评一样修改 `env`、Conda 环境和相关选项，
+不需要为 FP8 改动 evaluator。
 
 ## EmbodiedBench 推理设置与格式约束
 
