@@ -92,9 +92,11 @@ def validate_structured_output(text, validator):
         value = json.loads(text)
         validator.validate(value)
     except json.JSONDecodeError as error:
-        raise HTTPException(500, f'Constrained decoding produced invalid JSON: {error}') from error
+        raise HTTPException(500, f'Constrained decoding produced invalid JSON: {error}',
+                            headers={'x-should-retry': 'false'}) from error
     except ValidationError as error:
-        raise HTTPException(500, f'Model output failed JSON schema validation: {error.message}') from error
+        raise HTTPException(500, f'Model output failed JSON schema validation: {error.message}',
+                            headers={'x-should-retry': 'false'}) from error
 
 
 @app.post('/v1/chat/completions')

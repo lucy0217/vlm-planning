@@ -264,6 +264,14 @@ EmbodiedBench 环境，只需像常规测评一样修改 `env`、Conda 环境和
 - 服务使用 XGrammar 在每一步采样时约束合法 token；生成完成后，再用 `jsonschema` 按同一份 schema 校验。若 schema 本身不合法或结果未通过校验，接口明确返回错误，不把非法 JSON 交给 EmbodiedBench。
 - `response_format=json_object` 同样约束顶层必须是 JSON object；普通 `text` 请求不启用格式约束。
 
+输出未通过 JSON/schema 后校验时，服务仍返回 HTTP 500，并通过
+`x-should-retry: false` 阻止 SDK 自动重试。VLMPlanner 识别这两种明确的
+输出校验错误，记录一次 `output_json_error` 和 planner step，返回 `action=-1`。
+EB-Habitat 会累计 invalid action，达到现有上限（10 次）后保存当前 episode
+的失败结果并继续下一集。其他 HTTP 错误、网络故障和 CUDA 错误不走此兜底。
+旧服务返回的同类错误也能被新客户端识别，但 SDK 可能先做有限次数的重试。
+更新后需要重启测评进程；要启用禁止 SDK 重试的响应头，还需重启模型服务。
+
 健康检查中的 `schema_mode` 应为：
 
 ```text
