@@ -1,3 +1,4 @@
+# Captured from lmdeploy on 2026-10-28 (Linux x86_64).
 accelerate==1.15.0
 addict==2.4.0
 aiohappyeyeballs==2.7.1
@@ -31,8 +32,8 @@ huggingface_hub==0.36.2
 idna==3.20
 Jinja2==3.1.6
 jiter==0.17.0
-jsonschema==4.26.0
 jsonschema-specifications==2025.9.1
+jsonschema==4.26.0
 lmdeploy==0.13.0
 markdown-it-py==4.2.0
 MarkupSafe==3.0.4
@@ -60,15 +61,15 @@ nvidia-nccl-cu12==2.27.5
 nvidia-nvjitlink-cu12==12.8.93
 nvidia-nvshmem-cu12==3.4.5
 nvidia-nvtx-cu12==12.8.90
-openai==3.35.1
 openai-harmony==0.0.8
+openai==3.35.1
 opencv-python-headless==5.0.0.93
 opentelemetry-api==1.45.1
 packaging==26.3
 partial-json-parser==0.2.1.1.post7
 peft==0.14.0
 pillow==13.0.0
-pip @ file:///home/task_178792879927882/croot/pip_1787928831568/work
+pip==26.2.1
 platformdirs==4.13.5
 prometheus_client==0.26.0
 propcache==0.5.4

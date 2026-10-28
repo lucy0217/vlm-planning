@@ -1,0 +1,24 @@
+# Captured 2026-10-28; Linux x86_64; conda packages only.
+@EXPLICIT
+https://repo.anaconda.com/pkgs/main/linux-64/_libgcc_mutex-0.1-main.conda#c3473ff8bdb3d124ed5ff11ec380d6f9
+https://repo.anaconda.com/pkgs/main/linux-64/_openmp_mutex-5.1-1_gnu.conda#71d281e9c2192cb3fa425655a8defb85
+https://repo.anaconda.com/pkgs/main/linux-64/bzip2-1.0.8-h5eee18b_6.conda#f21a3ff51c1b271977f53ce956a69297
+https://repo.anaconda.com/pkgs/main/linux-64/ca-certificates-2026.9.25-h06a4308_0.conda#468fe035b94adab2c9246baf86d2deea
+https://repo.anaconda.com/pkgs/main/linux-64/ld_impl_linux-64-2.38-h1181459_1.conda#68eedfd9c06f2b0e6888d8db345b7f5b
+https://repo.anaconda.com/pkgs/main/linux-64/libffi-3.4.4-h6a678d5_1.conda#70646cc713f0c43926cfdcfe9b695fe0
+https://repo.anaconda.com/pkgs/main/linux-64/libgcc-ng-11.2.0-h1234567_1.conda#a87728dabf3151fb9cfa990bd2eb0464
+https://repo.anaconda.com/pkgs/main/linux-64/libgomp-11.2.0-h1234567_1.conda#b372c0eea9b60732fdae4b817a63c8cd
+https://repo.anaconda.com/pkgs/main/linux-64/libstdcxx-ng-11.2.0-h1234567_1.conda#57623d10a70e09e1d048c2b2b6f4e2dd
+https://repo.anaconda.com/pkgs/main/linux-64/libuuid-1.41.5-h5eee18b_0.conda#4a6a2354414c9080327274aa514e5299
+https://repo.anaconda.com/pkgs/main/linux-64/ncurses-6.4-h6a678d5_0.conda#5558eec6e2191741a92f832ea826251c
+https://repo.anaconda.com/pkgs/main/linux-64/openssl-3.0.18-hd6dcaed_0.conda#3762b8999909b69745881cf4b8dd2816
+https://repo.anaconda.com/pkgs/main/noarch/pip-26.2.1-pyhc872135_0.conda#786f51293908e5aee1a57518e298d346
+https://repo.anaconda.com/pkgs/main/linux-64/python-3.11.11-he870216_0.conda#3a858f6a0c1a5ce799f59d7e9e55ac17
+https://repo.anaconda.com/pkgs/main/linux-64/readline-8.2-h5eee18b_0.conda#be42180685cce6e6b0329201d9f48efb
+https://repo.anaconda.com/pkgs/main/linux-64/setuptools-72.1.0-py311h06a4308_0.conda#58a35dba367429761d046074dcfa8b19
+https://repo.anaconda.com/pkgs/main/linux-64/sqlite-3.45.3-h5eee18b_0.conda#acf93d6aceb74d6110e20b44cc45939e
+https://repo.anaconda.com/pkgs/main/linux-64/tk-8.6.14-h39e8969_0.conda#78dbc5e3c69143ebc037fc5d5b22e597
+https://repo.anaconda.com/pkgs/main/noarch/tzdata-2026c-he532380_0.conda#448fc60cd3fb615bf69e242f8aa22914
+https://repo.anaconda.com/pkgs/main/linux-64/wheel-0.43.0-py311h06a4308_0.conda#ec915b5ff89bdbcea7ef943d9e296967
+https://repo.anaconda.com/pkgs/main/linux-64/xz-5.4.6-h5eee18b_1.conda#1562802f843297ee776a50b9329597ed
+https://repo.anaconda.com/pkgs/main/linux-64/zlib-1.2.13-h5eee18b_1.conda#92e42d8310108b0a440fb2e60b2b2a25
