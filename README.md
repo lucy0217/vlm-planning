@@ -1,7 +1,9 @@
 # vlm-planning
 
 本仓库用于在 RTX 5090 服务器上运行 EmbodiedBench 的 EB-ALFRED（`eb-alf`）和
-EB-Habitat（`eb-hab`）。请使用 **`master` 分支**；`transformers-profile` 仍在开发。
+EB-Habitat（`eb-hab`）。三个顶层分支用途不同：`master` 保存可复现的基础运行配置，
+`transformers-profile` 保存延时、KV 和 attention profiling 实验，`kv-reuse` 从
+`master` 独立开发跨调用 KV 复用。后两者都是研究分支，不要把未验证改动直接合入 baseline。
 
 模型与测评分开运行：
 
@@ -23,6 +25,18 @@ git submodule status --recursive
 仓库会同时检出固定版本的 `third_party/EmbodiedBench`、`third_party/transformers`，
 以及 EmbodiedBench 内的 `habitat-lab`。子模块显示 detached HEAD 是正常现象；不要执行
 `git submodule update --remote`。
+
+如果要复现本文第 8 节的 KV 实验，切换顶层分支后必须同步它记录的子模块提交：
+
+```bash
+git switch kv-reuse
+git submodule update --init --recursive
+git branch --show-current
+git submodule status --recursive
+```
+
+仅运行实验时，Transformers 子模块处于 detached HEAD 是正常的；只有需要修改模型侧 KV
+代码时，才在子模块仓库中切换或创建开发分支。
 
 ## 2. 配置环境
 
@@ -341,3 +355,89 @@ python -m embodiedbench.main \
 tmux 中按 `Ctrl-b`，松开后按 `d` 可退出而不停止任务。开始前用 `nvidia-smi`
 选择空闲 GPU，并避免占用其他用户的端口。其它 EmbodiedBench 环境(manipulation, navigation,这里没有使用)见
 [third_party/EmbodiedBench/README.md](third_party/EmbodiedBench/README.md)。
+
+## 8. `kv-reuse` 分支：跨调用 KV 复用与消融
+
+本节给出运行方法；模块职责、P/A/B/C/S 的精确定义、缓存生命周期和完整调用链参见
+[inference/README.md](inference/README.md)。
+
+该实验使用三处相互隔离的状态：
+
+| 对象 | 名称 | 内容 |
+| --- | --- | --- |
+| 顶层仓库分支 | `kv-reuse` | 服务、prompt 分段、测评包装器和统计 |
+| Transformers 子模块记录版本 | `kv-reuse` 开发分支上的提交 | Qwen3-VL 分段 prefill 与相对 mRoPE 修正 |
+| Conda 环境 | `vlm-profile` | 模型服务依赖，不保存源码 |
+
+EmbodiedBench 子模块保持固定提交，不需要创建实验分支。服务支持三个互斥模式：
+
+| 模式 | 首次调用后保存 | 后续完整计算 | 后续复用 |
+| --- | --- | --- | --- |
+| `off` | 无 | P/A/B/C/S | 无 |
+| `a` | A 每层 post-RoPE K/V | P/B/C/S | A K/V |
+| `ac` | A/C 每层 post-RoPE K/V | P/B/S | A K/V；C V 与位置修正后的 K |
+
+`a` 是 A-only 消融，当前 C 会重新执行投影、Attention 和 MLP。`ac` 中 C 的 K 使用旧、新
+三维 mRoPE 的相对旋转修正，C 的 V 和位置不变的 A K/V 直接复用。
+
+这里的序列划分为 `P + A + B + C + S`：P 包含当前图片和 chat template 前缀；A 包含固定
+规则、动作表、few-shot 和当前任务指令；B 是动态动作历史与环境反馈；C 是 JSON 输出格式说明；
+S 是 assistant generation prompt。A 位于当前图片之后，所以复用 A 会引入首张图片对
+A hidden state/KV 的影响导致精度下降。
+
+### 8.1 启动 AC 复用服务
+
+```bash
+tmux new -s qwen3-kv-server
+conda activate vlm-profile
+cd /YOUR/PATH/vlm-planning
+
+CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 \
+python inference/server.py \
+  --model-path /YOUR/MODELS/Qwen3-VL-8B-Instruct \
+  --model-name Qwen/Qwen3-VL-8B-Instruct \
+  --dtype bfloat16 \
+  --port 8001 \
+  --kv-reuse-mode ac
+```
+
+调试边界或 cache mismatch 时可添加 `--kv-reuse-strict`；正式长测评不添加，校验失败的
+请求会完整 prefill 并在 JSONL 中记录原因，但不会替换 episode 首次调用建立的 canonical
+cache。A-only 消融把模式改为 `a`，baseline 改为 `off`。
+三个模式必须分别重启服务。
+
+### 8.2 运行带 episode 上下文的测评
+
+`a`/`ac` 必须使用包装器运行，而不是直接执行 `embodiedbench.main`，否则 HTTP 请求没有
+episode ID，服务会安全回退。`off` 也应使用同一包装器，才能获得相同 prompt 规范化、episode
+选择和性能日志。包装器不会修改 EmbodiedBench 源码；它会统一 EmbodiedBench 首次和后续
+prompt 中 few-shot 标题及 action-history 前的空白差异，使实验定义的 A 段真正 token 一致。
+`off`、`a` 和 `ac` 都执行相同规范化。
+
+```bash
+tmux new -s qwen3-kv-eval
+conda activate embench
+cd /YOUR/PATH/vlm-planning/third_party/EmbodiedBench
+export DISPLAY=:1
+export OPENAI_API_KEY=EMPTY
+
+python /YOUR/PATH/vlm-planning/scripts/kv_reuse/run_embodiedbench.py \
+  --benchmark eb-alf \
+  --base-url http://127.0.0.1:8001/v1 \
+  --model-name Qwen/Qwen3-VL-8B-Instruct \
+  --kv-mode ac \
+  --eval-set base \
+  --episodes 1 \
+  --output-dir /YOUR/PATH/vlm-planning/inference/kv_reuse/runs/eb_alf_ac \
+  --save-prompts
+```
+
+完整消融时分别启动 `off`、`a` 和 `ac` 服务，并让包装器的 `--kv-mode` 与服务一致。EB-ALFRED
+可用 `--episode-indexes 0,1,2,3,4` 固定样本；EB-Habitat 改为 `--benchmark eb-hab`，并用
+`--start-episode-index` 指定连续样本起点。`--output-dir` 必须位于仓库的
+`inference/kv_reuse/runs/` 下。每个目录中并列保存 `manifest.json`、`calls.jsonl` 和
+`server_metrics.jsonl`；使用 `--save-prompts` 时还会创建 `prompts/`。每次实验应使用新的
+`--output-dir`，否则 JSONL 会追加到已有文件。EmbodiedBench 的 episode 结果仍写入
+`third_party/EmbodiedBench/running/`，其绝对路径记录在 `manifest.json` 的
+`evaluation_results` 字段中。
+

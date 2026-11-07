@@ -16,9 +16,13 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from xgrammar.contrib.hf import LogitsProcessor
 
+from kv_reuse import ACKVReuseEngine
+from kv_reuse.metrics import JSONLMetricsWriter
+
 app = FastAPI(title="vlm-planning Transformers service")
 lock = threading.Lock()
-model = processor = args = grammar_compiler = None
+model = processor = args = grammar_compiler = reuse_engine = metrics_writer = None
+RUNS_ROOT = Path(__file__).resolve().parent / 'kv_reuse' / 'runs'
 
 
 @app.get('/health')
@@ -29,6 +33,10 @@ def health():
                 transformers_version=transformers.__version__,
                 xgrammar_version=importlib.metadata.version('xgrammar'),
                 dtype=args.dtype, attention='sdpa',
+                kv_reuse_mode=args.kv_reuse_mode,
+                kv_reuse_log=args.kv_reuse_log,
+                kv_reuse_runs_root=str(RUNS_ROOT),
+                automatic_metrics_filename='server_metrics.jsonl',
                 schema_mode='xgrammar+jsonschema-validation')
 
 
@@ -115,6 +123,11 @@ def complete(request: dict):
     if temperature < 0:
         raise HTTPException(400, 'temperature must be nonnegative')
     response_format = request.get('response_format') or {'type': 'text'}
+    reuse_context = request.get('kv_reuse_context')
+    try:
+        metrics_writer.resolve_path(reuse_context)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
     messages = convert_messages(messages)
     with lock:
         started = time.perf_counter()
@@ -132,7 +145,8 @@ def complete(request: dict):
         if logits_processor is not None:
             kwargs['logits_processor'] = [logits_processor]
         with torch.inference_mode():
-            output = model.generate(**inputs, **kwargs)
+            output, reuse_metadata = reuse_engine.generate(
+                inputs, messages, reuse_context, kwargs)
         torch.cuda.synchronize()
         finished = time.perf_counter()
         generated = output[0, prompt_tokens:]
@@ -147,10 +161,23 @@ def complete(request: dict):
                   choices=[dict(index=0, message=dict(role='assistant', content=text), finish_reason=reason)],
                   usage=dict(prompt_tokens=prompt_tokens, completion_tokens=len(token_ids),
                              total_tokens=prompt_tokens + len(token_ids)),
-                  server_timing=dict(preprocessing_seconds=prepared-started, generation_seconds=finished-prepared),
+                  server_timing=dict(preprocessing_seconds=prepared-started,
+                                     generation_seconds=finished-prepared,
+                                     **reuse_metadata['timing']),
+                  kv_reuse={key: value for key, value in reuse_metadata.items() if key != 'timing'},
                   schema_mode='xgrammar+jsonschema-validation')
+    metrics_writer.write({
+        'request_id': result['id'],
+        'created': result['created'],
+        'context': reuse_context,
+        'usage': result['usage'],
+        'finish_reason': reason,
+        **reuse_metadata,
+        'request_seconds': finished - started,
+    }, context=reuse_context)
     print(json.dumps({'request_id': result['id'], 'usage': result['usage'],
-                      'finish_reason': reason, 'timing': result['server_timing']}), flush=True)
+                      'finish_reason': reason, 'kv_reuse': result['kv_reuse'],
+                      'timing': result['server_timing']}), flush=True)
     return result
 
 
@@ -161,6 +188,11 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=8001)
     parser.add_argument('--dtype', choices=['bfloat16', 'float16'], default='bfloat16')
     parser.add_argument('--max-context', type=int, default=16000)
+    parser.add_argument('--kv-reuse-mode', choices=['off', 'a', 'ac'], default='off')
+    parser.add_argument('--kv-reuse-log',
+                        help='Legacy fixed JSONL path; wrapped evaluations log into their run directory')
+    parser.add_argument('--kv-reuse-strict', action='store_true',
+                        help='Fail instead of falling back when A/C reuse validation fails')
     args = parser.parse_args()
     args.model_path = str(Path(args.model_path).resolve())
     processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True)
@@ -171,5 +203,8 @@ if __name__ == '__main__':
     tokenizer_info = xgr.TokenizerInfo.from_huggingface(
         processor.tokenizer, vocab_size=vocab_size)
     grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+    reuse_engine = ACKVReuseEngine(model, processor.tokenizer, mode=args.kv_reuse_mode,
+                                   strict=args.kv_reuse_strict)
+    metrics_writer = JSONLMetricsWriter(args.kv_reuse_log, runs_root=RUNS_ROOT)
     import uvicorn
     uvicorn.run(app, host='127.0.0.1', port=args.port)
