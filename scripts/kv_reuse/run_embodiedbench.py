@@ -31,7 +31,10 @@ def parse_args():
     parser.add_argument("--benchmark", required=True, choices=("eb-alf", "eb-hab"))
     parser.add_argument("--base-url", default="http://127.0.0.1:8001/v1")
     parser.add_argument("--model-name", default="Qwen/Qwen3-VL-8B-Instruct")
-    parser.add_argument("--kv-mode", choices=("off", "a", "ac"), required=True)
+    parser.add_argument("--kv-mode", choices=("off", "a", "ac", "a-layerwise"), required=True)
+    parser.add_argument("--kv-reuse-a-parts", default="",
+                        help="Comma-separated A1-A6 parts for a-layerwise mode")
+    parser.add_argument("--kv-recompute-prefix-layers", type=int, default=1)
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--eval-set", default="base")
     parser.add_argument("--episode-indexes", help="Comma-separated zero-based indexes for EB-ALFRED")
@@ -47,6 +50,19 @@ def parse_args():
         parser.error("--episode-indexes is only supported by EB-ALFRED")
     if args.benchmark == "eb-alf" and args.start_episode_index:
         parser.error("--start-episode-index is only supported by EB-Habitat")
+    try:
+        args.kv_reuse_a_parts = tuple(
+            int(value) for value in args.kv_reuse_a_parts.split(",") if value.strip()
+        )
+    except ValueError:
+        parser.error("--kv-reuse-a-parts must contain comma-separated integers")
+    if args.kv_mode == "a-layerwise" and not args.kv_reuse_a_parts:
+        parser.error("--kv-reuse-a-parts is required for a-layerwise mode")
+    if args.kv_mode != "a-layerwise" and args.kv_reuse_a_parts:
+        parser.error("--kv-reuse-a-parts is only valid for a-layerwise mode")
+    if any(part not in range(1, 7) for part in args.kv_reuse_a_parts):
+        parser.error("A parts must be integers from 1 through 6")
+    args.kv_reuse_a_parts = tuple(sorted(set(args.kv_reuse_a_parts)))
     return args
 
 
@@ -70,11 +86,14 @@ def main():
     from embodiedbench.planner.vlm_planner import VLMPlanner
 
     timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S")
-    run_id = f"{args.benchmark}-{args.eval_set}-{args.kv_mode}-{timestamp}"
+    strategy = args.kv_mode
+    if args.kv_mode == "a-layerwise":
+        strategy = "a" + "".join(str(part) for part in args.kv_reuse_a_parts) + f"_l{args.kv_recompute_prefix_layers}"
+    run_id = f"{args.benchmark}-{args.eval_set}-{strategy}-{timestamp}"
     common = {
         "model_name": args.model_name,
         "model_type": "remote",
-        "exp_name": f"kv_{args.kv_mode}_{timestamp}",
+        "exp_name": f"kv_{strategy}_{timestamp}",
         "eval_sets": [args.eval_set],
     }
     if args.benchmark == "eb-alf":
@@ -141,6 +160,8 @@ def main():
             "env_step": evaluator.env._current_step,
             "planner_step": planner.planner_steps,
             "kv_mode": args.kv_mode,
+            "a_parts": list(args.kv_reuse_a_parts),
+            "recompute_prefix_layers": args.kv_recompute_prefix_layers,
             "run_dir": str(output),
         }
         completions = planner.model.model.chat.completions
@@ -181,6 +202,9 @@ def main():
         "run_id": run_id,
         "benchmark": args.benchmark,
         "kv_mode": args.kv_mode,
+        "strategy": strategy,
+        "reused_a_parts": list(args.kv_reuse_a_parts),
+        "recompute_prefix_layers": args.kv_recompute_prefix_layers,
         "base_url": args.base_url,
         "config": OmegaConf.to_container(config),
         "calls_file": str(output / "calls.jsonl"),

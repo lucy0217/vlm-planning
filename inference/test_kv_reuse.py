@@ -24,7 +24,9 @@ class CharacterTokenizer:
 class KVReuseProjectTest(unittest.TestCase):
     def test_embodiedbench_prompt_segments(self):
         text = (
-            "System rules. ## Now the human instruction is: put the cup away."
+            "System rules. ## The available action id list. action id 0: find. "
+            "action id 162: dynamic. ## Task Execution Example 0: example. "
+            "## Guidelines follow. ## Now the human instruction is: put the cup away."
             " You are supposed to output in json. Dynamic first call. "
             "The output json format should be {action: int}"
         )
@@ -35,6 +37,12 @@ class KVReuseProjectTest(unittest.TestCase):
         self.assertEqual(located.model.c_end, full_ids.shape[-1] - 1)
         self.assertGreater(located.token_counts["B"], 0)
         self.assertEqual(located.token_counts["S"], 1)
+        self.assertEqual(sum(located.token_counts[f"A{i}"] for i in range(1, 7)), located.token_counts["A"])
+        for parts in ((1, 5), (1, 4, 5), (1, 2, 5), (1, 2, 3, 4, 5, 6)):
+            mask = located.reuse_mask(parts)
+            self.assertEqual(
+                int(mask.sum()), sum(located.token_counts[f"A{i}"] for i in parts)
+            )
 
     def test_episode_change_releases_canonical_state(self):
         manager = EpisodeCacheManager()

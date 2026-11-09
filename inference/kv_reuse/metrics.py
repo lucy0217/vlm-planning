@@ -37,6 +37,8 @@ class ModelStageTimer:
             return hook
 
         def post(module, args, kwargs, output):
+            if id(module) not in pending:
+                return
             name, sequence_length, started = pending.pop(id(module))
             if torch.cuda.is_available():
                 finished = torch.cuda.Event(enable_timing=True)
@@ -50,6 +52,20 @@ class ModelStageTimer:
         language = self.model.model.language_model
         self.handles.append(language.register_forward_pre_hook(pre("language"), with_kwargs=True))
         self.handles.append(language.register_forward_hook(post, with_kwargs=True))
+        for layer_index, layer in enumerate(language.layers):
+            def layer_pre(module, args, kwargs, index=layer_index):
+                plan = kwargs.get("layerwise_kv_reuse")
+                if plan is None:
+                    return
+                if torch.cuda.is_available():
+                    started = torch.cuda.Event(enable_timing=True)
+                    started.record()
+                else:
+                    started = time.perf_counter()
+                pending[id(module)] = (f"layerwise_layer_{index}", None, started)
+
+            self.handles.append(layer.register_forward_pre_hook(layer_pre, with_kwargs=True))
+            self.handles.append(layer.register_forward_hook(post, with_kwargs=True))
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
@@ -65,7 +81,7 @@ class ModelStageTimer:
                 records.append((name, length, started.elapsed_time(finished) / 1000.0))
             else:
                 records.append(record)
-        return {
+        summary = {
             "vision_seconds": sum(duration for name, _, duration in records if name == "vision"),
             "prefill_seconds": sum(
                 duration for name, length, duration in records if name == "language" and length != 1
@@ -74,6 +90,13 @@ class ModelStageTimer:
                 duration for name, length, duration in records if name == "language" and length == 1
             ),
         }
+        summary["layer1_full_seconds"] = sum(
+            duration for name, _, duration in records if name == "layerwise_layer_0"
+        )
+        summary["later_layers_mixed_seconds"] = sum(
+            duration for name, _, duration in records if name.startswith("layerwise_layer_") and name != "layerwise_layer_0"
+        )
+        return summary
 
 
 class JSONLMetricsWriter:

@@ -369,13 +369,14 @@ tmux 中按 `Ctrl-b`，松开后按 `d` 可退出而不停止任务。开始前�
 | Transformers 子模块记录版本 | `kv-reuse` 开发分支上的提交 | Qwen3-VL 分段 prefill 与相对 mRoPE 修正 |
 | Conda 环境 | `vlm-profile` | 模型服务依赖，不保存源码 |
 
-EmbodiedBench 子模块保持固定提交，不需要创建实验分支。服务支持三个互斥模式：
+EmbodiedBench 子模块保持固定提交，不需要创建实验分支。服务支持四个互斥模式：
 
 | 模式 | 首次调用后保存 | 后续完整计算 | 后续复用 |
 | --- | --- | --- | --- |
 | `off` | 无 | P/A/B/C/S | 无 |
 | `a` | A 每层 post-RoPE K/V | P/B/C/S | A K/V |
 | `ac` | A/C 每层 post-RoPE K/V | P/B/S | A K/V；C V 与位置修正后的 K |
+| `a-layerwise` | A 每层 post-RoPE K/V | 第1层全部；后续层的未选 A、P/B/C/S | 后续层所选 A 子段 K/V |
 
 `a` 是 A-only 消融，当前 C 会重新执行投影、Attention 和 MLP。`ac` 中 C 的 K 使用旧、新
 三维 mRoPE 的相对旋转修正，C 的 V 和位置不变的 A K/V 直接复用。
@@ -404,11 +405,25 @@ python inference/server.py \
 调试边界或 cache mismatch 时可添加 `--kv-reuse-strict`；正式长测评不添加，校验失败的
 请求会完整 prefill 并在 JSONL 中记录原因，但不会替换 episode 首次调用建立的 canonical
 cache。A-only 消融把模式改为 `a`，baseline 改为 `off`。
-三个模式必须分别重启服务。
+各模式及不同 `a-layerwise` 子段配置必须分别重启服务。
+
+分层 A 子段实验例如 A1+A5：
+
+```bash
+CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 \
+python inference/server.py \
+  --model-path /YOUR/MODELS/Qwen3-VL-8B-Instruct \
+  --model-name Qwen/Qwen3-VL-8B-Instruct \
+  --dtype bfloat16 \
+  --port 8001 \
+  --kv-reuse-mode a-layerwise \
+  --kv-reuse-a-parts 1,5 \
+  --kv-recompute-prefix-layers 1
+```
 
 ### 8.2 运行带 episode 上下文的测评
 
-`a`/`ac` 必须使用包装器运行，而不是直接执行 `embodiedbench.main`，否则 HTTP 请求没有
+所有 KV 实验必须使用包装器运行，而不是直接执行 `embodiedbench.main`，否则 HTTP 请求没有
 episode ID，服务会安全回退。`off` 也应使用同一包装器，才能获得相同 prompt 规范化、episode
 选择和性能日志。包装器不会修改 EmbodiedBench 源码；它会统一 EmbodiedBench 首次和后续
 prompt 中 few-shot 标题及 action-history 前的空白差异，使实验定义的 A 段真正 token 一致。
@@ -441,3 +456,14 @@ python /YOUR/PATH/vlm-planning/scripts/kv_reuse/run_embodiedbench.py \
 `third_party/EmbodiedBench/running/`，其绝对路径记录在 `manifest.json` 的
 `evaluation_results` 字段中。
 
+对应上面的 A1+A5 服务，包装器需增加相同配置：
+
+```bash
+python /YOUR/PATH/vlm-planning/scripts/kv_reuse/run_embodiedbench.py \
+  --benchmark eb-alf --base-url http://127.0.0.1:8001/v1 \
+  --model-name Qwen/Qwen3-VL-8B-Instruct \
+  --kv-mode a-layerwise --kv-reuse-a-parts 1,5 \
+  --kv-recompute-prefix-layers 1 --eval-set base --episodes 50 \
+  --output-dir /YOUR/PATH/vlm-planning/inference/kv_reuse/runs/eb_alf_base_a15_l1_epi50_GROUP \
+  --save-prompts
+```

@@ -34,6 +34,8 @@ def health():
                 xgrammar_version=importlib.metadata.version('xgrammar'),
                 dtype=args.dtype, attention='sdpa',
                 kv_reuse_mode=args.kv_reuse_mode,
+                kv_reuse_a_parts=list(args.kv_reuse_a_parts),
+                kv_recompute_prefix_layers=args.kv_recompute_prefix_layers,
                 kv_reuse_log=args.kv_reuse_log,
                 kv_reuse_runs_root=str(RUNS_ROOT),
                 automatic_metrics_filename='server_metrics.jsonl',
@@ -152,7 +154,11 @@ def complete(request: dict):
         generated = output[0, prompt_tokens:]
         token_ids = generated.tolist()
         text = processor.decode(token_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-        validate_structured_output(text, validator)
+        validation_error = None
+        try:
+            validate_structured_output(text, validator)
+        except HTTPException as error:
+            validation_error = error
         eos = model.generation_config.eos_token_id
         eos = eos if isinstance(eos, list) else [eos]
         reason = 'stop' if token_ids and token_ids[-1] in eos else ('length' if len(token_ids) >= limit else 'stop')
@@ -172,9 +178,12 @@ def complete(request: dict):
         'context': reuse_context,
         'usage': result['usage'],
         'finish_reason': reason,
+        'output_validation': 'failed' if validation_error is not None else 'passed',
         **reuse_metadata,
         'request_seconds': finished - started,
     }, context=reuse_context)
+    if validation_error is not None:
+        raise validation_error
     print(json.dumps({'request_id': result['id'], 'usage': result['usage'],
                       'finish_reason': reason, 'kv_reuse': result['kv_reuse'],
                       'timing': result['server_timing']}), flush=True)
@@ -188,12 +197,26 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=8001)
     parser.add_argument('--dtype', choices=['bfloat16', 'float16'], default='bfloat16')
     parser.add_argument('--max-context', type=int, default=16000)
-    parser.add_argument('--kv-reuse-mode', choices=['off', 'a', 'ac'], default='off')
+    parser.add_argument('--kv-reuse-mode', choices=['off', 'a', 'ac', 'a-layerwise'], default='off')
+    parser.add_argument('--kv-reuse-a-parts', default='',
+                        help='Comma-separated A1-A6 parts used by a-layerwise mode, e.g. 1,5')
+    parser.add_argument('--kv-recompute-prefix-layers', type=int, default=1,
+                        help='Number of initial text layers fully recomputed in a-layerwise mode')
     parser.add_argument('--kv-reuse-log',
                         help='Legacy fixed JSONL path; wrapped evaluations log into their run directory')
     parser.add_argument('--kv-reuse-strict', action='store_true',
                         help='Fail instead of falling back when A/C reuse validation fails')
     args = parser.parse_args()
+    try:
+        args.kv_reuse_a_parts = tuple(
+            int(value) for value in args.kv_reuse_a_parts.split(',') if value.strip()
+        )
+    except ValueError:
+        parser.error('--kv-reuse-a-parts must contain comma-separated integers')
+    if args.kv_reuse_mode == 'a-layerwise' and not args.kv_reuse_a_parts:
+        parser.error('--kv-reuse-a-parts is required for a-layerwise mode')
+    if args.kv_reuse_mode != 'a-layerwise' and args.kv_reuse_a_parts:
+        parser.error('--kv-reuse-a-parts is only valid for a-layerwise mode')
     args.model_path = str(Path(args.model_path).resolve())
     processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True)
     model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -204,7 +227,9 @@ if __name__ == '__main__':
         processor.tokenizer, vocab_size=vocab_size)
     grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
     reuse_engine = ACKVReuseEngine(model, processor.tokenizer, mode=args.kv_reuse_mode,
-                                   strict=args.kv_reuse_strict)
+                                   strict=args.kv_reuse_strict,
+                                   a_parts=args.kv_reuse_a_parts,
+                                   recompute_prefix_layers=args.kv_recompute_prefix_layers)
     metrics_writer = JSONLMetricsWriter(args.kv_reuse_log, runs_root=RUNS_ROOT)
     import uvicorn
     uvicorn.run(app, host='127.0.0.1', port=args.port)

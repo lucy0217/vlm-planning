@@ -12,8 +12,8 @@ inference/
 ├── server.py                 # HTTP 服务、结构化生成和模型加载入口
 └── kv_reuse/                 # 服务端 KV 复用库，不是独立命令行程序
     ├── __init__.py           # 导出 ACKVReuseEngine
-    ├── engine.py             # off/a/ac 调度、首次缓存和 hit/miss 回退
-    ├── segments.py           # 从 EmbodiedBench prompt 定位 P/A/B/C/S
+    ├── engine.py             # off/a/ac/a-layerwise 调度、首次缓存和回退
+    ├── segments.py           # 定位 P/A1-A6/B/C/S，并生成子段 mask
     ├── cache_manager.py      # canonical cache 的 episode 隔离和生命周期
     ├── metrics.py            # CUDA 分阶段计时与 JSONL 日志路由
     └── runs/                 # 本地实验产物，已被 Git 忽略
@@ -96,18 +96,25 @@ P + A + B + C + S
 受到首张图片和前文影响。因此 `a`/`ac` 是有意进行的近似复用实验，不是数值等价的 prefix
 cache；它可能保留旧视觉语义并降低任务成功率。
 
-## `off`、`a`、`ac` 执行路径
+## `off`、`a`、`ac`、`a-layerwise` 执行路径
 
-`server.py` 通过 `--kv-reuse-mode off|a|ac` 创建 `ACKVReuseEngine`：
+`server.py` 通过 `--kv-reuse-mode off|a|ac|a-layerwise` 创建 `ACKVReuseEngine`：
 
 | 模式 | 首次请求 | 同 episode 后续 cache hit |
 | --- | --- | --- |
 | `off` | 标准完整 `generate()`，不保存 canonical cache | 每次完整计算 P/A/B/C/S |
 | `a` | 完整 prefill，并保存每层 A 的 post-RoPE K/V | 计算 P，拼入旧 A KV，再完整计算 B/C/S |
 | `ac` | 完整 prefill，并保存每层 A/C 的 post-RoPE K/V | 计算 P，拼入旧 A，计算 B，修正并拼入旧 C，计算 S |
+| `a-layerwise` | 完整 prefill，并保存每层 A 的 post-RoPE K/V | 第1层计算全部 token；第2–36层只跳过指定 A 子段，其他 token（包括 C/S）重算 |
 
 AC 模式中，C 的 V 直接复用；C 的 K 使用旧、新三维 mRoPE position IDs 做相对旋转。canonical
 cache 始终以该 episode 第一次调用为基准，命中后不会滚动更新。
+
+`a-layerwise` 把 A 连续划分为：A1 角色与动作规则、A2 固定动作 ID 0–161、A3 动态动作
+ID≥162、A4 10-shot examples、A5 Guidelines、A6 当前 human instruction。使用
+`--kv-reuse-a-parts 1,5` 选择子段，使用 `--kv-recompute-prefix-layers 1` 指定完整重算的
+前缀层数。所选 token 在后续层不进入 Q/K/V projection、Attention query 或 MLP；其 canonical
+K/V 被拼入完整 cache，供未选 token 的当前 query 使用。该路径是近似实验，不保证与完整推理等价。
 
 详细调用关系如下：
 
@@ -119,7 +126,8 @@ server.complete()
   │   ├── segments.locate_prompt_segments()   # 得到 P/A/B/C/S 边界
   │   ├── EpisodeCacheManager.state_for()     # 读取唯一活动 episode 的缓存
   │   ├── first：标准 generate() 后 build_*_reuse_state()
-  │   ├── hit：prefill_with_a_reuse() 或 prefill_with_ac_reuse()
+  │   ├── hit：prefill_with_a_reuse()/prefill_with_ac_reuse()/
+  │   │        prefill_with_layerwise_a_reuse()
   │   └── miss：非 strict 时完整 generate()
   ├── metrics.ModelStageTimer                 # vision/prefill/decode 计时
   └── JSONLMetricsWriter.write()              # 写 server_metrics.jsonl
@@ -144,6 +152,8 @@ server.complete()
     "env_step": 2,
     "planner_step": 3,
     "kv_mode": "ac",
+    "a_parts": [],
+    "recompute_prefix_layers": 1,
     "run_dir": "/.../inference/kv_reuse/runs/example"
   }
 }
@@ -156,6 +166,9 @@ episode 的首次 canonical cache；切换 episode 会释放旧缓存。服务�
 `a` 模式要求 A token、A 三维 position IDs 和区间一致；`ac` 额外要求 C token 和长度一致，
 但允许 C 的 position IDs 改变。缺少 context、marker 不唯一、token 不匹配或模式不匹配都会
 产生 miss：
+
+`a-layerwise` 只校验所选 A 子段的 token/三维 position IDs，并要求请求中的 `a_parts` 和
+`recompute_prefix_layers` 与服务启动配置完全一致。
 
 - 默认行为：本次请求回退完整 prefill，记录 `cache_miss_reason`，但不替换首次 canonical cache。
 - `--kv-reuse-strict`：直接报错，适合开发定位，不适合长时间正式测评。
@@ -184,9 +197,10 @@ EmbodiedBench 自己的 episode JSON 和 `summary.json` 仍保存在
 `third_party/EmbodiedBench/running/`；包装器不会把这些文件复制进 run 目录，而是在 manifest
 中记录其绝对路径。
 
-`scripts/kv_reuse/summarize_metrics.py` 汇总请求数、hit/miss、复用 token 和平均耗时。提供
-`--baseline-jsonl` 时，它按 benchmark、eval set、episode、planner step 配对 baseline 与 hit
-请求，报告 prefill 和 generation speedup。off/a/ac 应使用相同 episode 列表分别运行。
+现有 `scripts/kv_reuse/summarize_metrics.py` 是早期 off/a/ac 日志的可选汇总工具；本轮分层
+实验不运行也不修改它，直接读取 `server_metrics.jsonl` 和 EmbodiedBench `summary.json`。
+分层日志额外记录 A1–A6 token 数、`reused_token_layers`、`computed_prefill_token_layers`、
+`layer1_full_seconds`、`later_layers_mixed_seconds` 和 `kv_assembly_seconds`。
 
 ## Smoke 测试与当前限制
 
@@ -197,6 +211,6 @@ EmbodiedBench 自己的 episode JSON 和 `summary.json` 仍保存在
 
 - 仅适配 Qwen3-VL，且只支持单 GPU、batch size 1、非流式和 `n=1`；
 - 不支持 batching、beam search、tool calling 或多个并发 episode；
-- KV 模式目前按所有层整体复用 A/AC，不支持分层动态选择；
+- `a-layerwise` 当前只支持所有后续层使用同一个 A 子段 mask；尚不支持逐层改变 mask；
 - `finish_reason=length` 表示达到 completion token 上限，遇到 EOS 返回 `stop`；
 - `server_metrics.jsonl` 只在生成和校验成功后写入，HTTP 处理早期失败可能没有对应记录。
