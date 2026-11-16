@@ -9,6 +9,7 @@ from transformers.models.qwen3_vl.kv_reuse import Qwen3VLACSegments
 A_MARKER = "## Now the human instruction is:"
 ACTION_TABLE_MARKER = "## The available action id"
 DYNAMIC_ACTION_MARKER = "action id 162:"
+FIXED_ACTION_START_MARKER = "action id 0:"
 EXAMPLES_MARKER = "## Task Execution Example 0:"
 GUIDELINES_MARKER = "## Guidelines"
 FIRST_B_MARKER = " You are supposed to output in json."
@@ -22,6 +23,10 @@ class PromptSegments:
     model: Qwen3VLACSegments
     character_spans: dict[str, tuple[int, int]]
     a_parts: dict[int, slice]
+    # A2's table title contains the scene-dependent maximum action ID (for
+    # example, ``0 ~ 207``).  It is deliberately *not* part of the global
+    # a-precompute memory; only the fixed IDs 0--161 are stable across scenes.
+    precompute_a_parts: dict[int, slice]
 
     @property
     def token_counts(self) -> dict[str, int]:
@@ -96,6 +101,7 @@ def locate_prompt_segments(tokenizer, input_ids: torch.Tensor, messages: list[di
     examples_start = _unique_find(text, EXAMPLES_MARKER)
     guidelines_start = _unique_find(text, GUIDELINES_MARKER)
     dynamic_action_start = _unique_find(text, DYNAMIC_ACTION_MARKER)
+    fixed_action_start = _unique_find(text, FIXED_ACTION_START_MARKER)
     c_start = _unique_find(text, C_MARKER)
     history_position = text.find(HISTORY_B_MARKER, instruction_start)
     if history_position < 0:
@@ -119,6 +125,7 @@ def locate_prompt_segments(tokenizer, input_ids: torch.Tensor, messages: list[di
     character_spans = {
         "A": (0, a_end),
         "C": (c_start, len(text)),
+        "A2_fixed": (fixed_action_start, dynamic_action_start),
         **{f"A{part}": (boundaries[part - 1], boundaries[part]) for part in range(1, 7)},
     }
     token_spans = {}
@@ -147,6 +154,8 @@ def locate_prompt_segments(tokenizer, input_ids: torch.Tensor, messages: list[di
     )
     segments.validate()
     a_parts = {part: slice(*token_spans[f"A{part}"]) for part in range(1, 7)}
+    precompute_a_parts = dict(a_parts)
+    precompute_a_parts[2] = slice(*token_spans["A2_fixed"])
     expected_start = segments.a_start
     for part, span in a_parts.items():
         if span.start != expected_start:
@@ -154,4 +163,9 @@ def locate_prompt_segments(tokenizer, input_ids: torch.Tensor, messages: list[di
         expected_start = span.stop
     if expected_start != segments.a_end:
         raise ValueError("A1-A6 token spans do not cover the complete A segment")
-    return PromptSegments(model=segments, character_spans=character_spans, a_parts=a_parts)
+    return PromptSegments(
+        model=segments,
+        character_spans=character_spans,
+        a_parts=a_parts,
+        precompute_a_parts=precompute_a_parts,
+    )

@@ -18,6 +18,7 @@ from xgrammar.contrib.hf import LogitsProcessor
 
 from kv_reuse import ACKVReuseEngine
 from kv_reuse.metrics import JSONLMetricsWriter
+from kv_reuse.precompute import PrecomputedKVEngine, PrecomputeError
 
 app = FastAPI(title="vlm-planning Transformers service")
 lock = threading.Lock()
@@ -37,6 +38,7 @@ def health():
                 kv_reuse_a_parts=list(args.kv_reuse_a_parts),
                 kv_recompute_prefix_layers=args.kv_recompute_prefix_layers,
                 kv_reuse_log=args.kv_reuse_log,
+                precompute_ready=isinstance(reuse_engine, PrecomputedKVEngine) and reuse_engine.prepared is not None,
                 kv_reuse_runs_root=str(RUNS_ROOT),
                 automatic_metrics_filename='server_metrics.jsonl',
                 schema_mode='xgrammar+jsonschema-validation')
@@ -46,6 +48,32 @@ def health():
 def models():
     return {'object': 'list', 'data': [{'id': args.model_name, 'object': 'model',
                                       'created': 0, 'owned_by': 'local'}]}
+
+
+def precompute_http_error(error):
+    return HTTPException(409, {'code': 'kv_precompute_error', 'message': str(error)},
+                         headers={'x-should-retry': 'false'})
+
+
+@app.post('/v1/kv-reuse/prepare')
+def prepare_kv(request: dict):
+    if not isinstance(reuse_engine, PrecomputedKVEngine):
+        raise precompute_http_error('service_not_in_a_precompute_mode')
+    if request.get('model') != args.model_name:
+        raise precompute_http_error('model_mismatch')
+    with lock:
+        try:
+            # Always use the validated run directory, independent of a legacy fixed log.
+            path = JSONLMetricsWriter(None, runs_root=RUNS_ROOT).resolve_path(request.get('context'))
+            if path is None:
+                raise ValueError('prepare_requires_run_dir')
+            result = reuse_engine.prepare(request.get('text'), request.get('a_parts', []))
+            with path.with_name('precompute_metrics.jsonl').open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps({**result, 'model': args.model_name,
+                                         'model_path': args.model_path}, ensure_ascii=False) + '\n')
+        except ValueError as error:
+            raise precompute_http_error(error) from error
+    return result
 
 
 def convert_messages(messages):
@@ -146,9 +174,15 @@ def complete(request: dict):
             kwargs['temperature'] = temperature
         if logits_processor is not None:
             kwargs['logits_processor'] = [logits_processor]
-        with torch.inference_mode():
-            output, reuse_metadata = reuse_engine.generate(
-                inputs, messages, reuse_context, kwargs)
+        try:
+            with torch.inference_mode():
+                output, reuse_metadata = reuse_engine.generate(
+                    inputs, messages, reuse_context, kwargs)
+        except PrecomputeError as error:
+            metrics_writer.write({'context': reuse_context, 'reuse_mode': 'a-precompute',
+                                  'cache_status': 'error', 'cache_miss_reason': str(error)},
+                                 context=reuse_context)
+            raise precompute_http_error(error) from error
         torch.cuda.synchronize()
         finished = time.perf_counter()
         generated = output[0, prompt_tokens:]
@@ -197,9 +231,9 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=8001)
     parser.add_argument('--dtype', choices=['bfloat16', 'float16'], default='bfloat16')
     parser.add_argument('--max-context', type=int, default=16000)
-    parser.add_argument('--kv-reuse-mode', choices=['off', 'a', 'ac', 'a-layerwise'], default='off')
+    parser.add_argument('--kv-reuse-mode', choices=['off', 'a', 'ac', 'a-layerwise', 'a-precompute'], default='off')
     parser.add_argument('--kv-reuse-a-parts', default='',
-                        help='Comma-separated A1-A6 parts used by a-layerwise mode, e.g. 1,5')
+                        help='A parts for a-layerwise; a-precompute supports 1, 1,2, 1,4, or 1,2,4')
     parser.add_argument('--kv-recompute-prefix-layers', type=int, default=1,
                         help='Number of initial text layers fully recomputed in a-layerwise mode')
     parser.add_argument('--kv-reuse-log',
@@ -213,10 +247,15 @@ if __name__ == '__main__':
         )
     except ValueError:
         parser.error('--kv-reuse-a-parts must contain comma-separated integers')
-    if args.kv_reuse_mode == 'a-layerwise' and not args.kv_reuse_a_parts:
-        parser.error('--kv-reuse-a-parts is required for a-layerwise mode')
-    if args.kv_reuse_mode != 'a-layerwise' and args.kv_reuse_a_parts:
-        parser.error('--kv-reuse-a-parts is only valid for a-layerwise mode')
+    if args.kv_reuse_mode in ('a-layerwise', 'a-precompute') and not args.kv_reuse_a_parts:
+        parser.error('--kv-reuse-a-parts is required for this reuse mode')
+    if args.kv_reuse_mode not in ('a-layerwise', 'a-precompute') and args.kv_reuse_a_parts:
+        parser.error('--kv-reuse-a-parts requires a-layerwise or a-precompute mode')
+    if args.kv_reuse_mode == 'a-precompute' and (
+        args.kv_reuse_a_parts not in ((1,), (1, 2), (1, 4), (1, 2, 4))
+        or args.kv_recompute_prefix_layers != 1
+    ):
+        parser.error('a-precompute requires 1, 1,2, 1,4, or 1,2,4 and exactly one recomputed layer')
     args.model_path = str(Path(args.model_path).resolve())
     processor = AutoProcessor.from_pretrained(args.model_path, local_files_only=True)
     model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -226,10 +265,13 @@ if __name__ == '__main__':
     tokenizer_info = xgr.TokenizerInfo.from_huggingface(
         processor.tokenizer, vocab_size=vocab_size)
     grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
-    reuse_engine = ACKVReuseEngine(model, processor.tokenizer, mode=args.kv_reuse_mode,
-                                   strict=args.kv_reuse_strict,
-                                   a_parts=args.kv_reuse_a_parts,
-                                   recompute_prefix_layers=args.kv_recompute_prefix_layers)
+    if args.kv_reuse_mode == 'a-precompute':
+        reuse_engine = PrecomputedKVEngine(model, processor.tokenizer, args.kv_reuse_a_parts)
+    else:
+        reuse_engine = ACKVReuseEngine(
+            model, processor.tokenizer, mode=args.kv_reuse_mode, strict=args.kv_reuse_strict,
+            a_parts=args.kv_reuse_a_parts, recompute_prefix_layers=args.kv_recompute_prefix_layers,
+        )
     metrics_writer = JSONLMetricsWriter(args.kv_reuse_log, runs_root=RUNS_ROOT)
     import uvicorn
     uvicorn.run(app, host='127.0.0.1', port=args.port)

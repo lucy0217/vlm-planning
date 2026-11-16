@@ -1,9 +1,10 @@
 # vlm-planning
 
 本仓库用于在 RTX 5090 服务器上运行 EmbodiedBench 的 EB-ALFRED（`eb-alf`）和
-EB-Habitat（`eb-hab`）。三个顶层分支用途不同：`master` 保存可复现的基础运行配置，
+EB-Habitat（`eb-hab`）。各顶层分支用途不同：`master` 保存可复现的基础运行配置，
 `transformers-profile` 保存延时、KV 和 attention profiling 实验，`kv-reuse` 从
-`master` 独立开发跨调用 KV 复用。后两者都是研究分支，不要把未验证改动直接合入 baseline。
+`master` 独立开发跨调用 KV 复用；`kv-precompute` 继承 `kv-reuse`，开发任务前独立文本
+预计算。后三者都是研究分支，不要把未验证改动直接合入 baseline。
 
 模型与测评分开运行：
 
@@ -26,10 +27,11 @@ git submodule status --recursive
 以及 EmbodiedBench 内的 `habitat-lab`。子模块显示 detached HEAD 是正常现象；不要执行
 `git submodule update --remote`。
 
-如果要复现本文第 8 节的 KV 实验，切换顶层分支后必须同步它记录的子模块提交：
+如果要复现 KV 实验，切换顶层分支后必须同步它记录的子模块提交。例如首次调用采集
+KV 的实验使用 `kv-reuse`，任务前独立预计算实验使用 `kv-precompute`：
 
 ```bash
-git switch kv-reuse
+git switch kv-precompute
 git submodule update --init --recursive
 git branch --show-current
 git submodule status --recursive
@@ -467,3 +469,33 @@ python /YOUR/PATH/vlm-planning/scripts/kv_reuse/run_embodiedbench.py \
   --output-dir /YOUR/PATH/vlm-planning/inference/kv_reuse/runs/eb_alf_base_a15_l1_epi50_GROUP \
   --save-prompts
 ```
+
+## 9. A1/A2/A4 任务前预计算实验（kv-precompute）
+
+顶层与 `third_party/transformers` 均使用 `kv-precompute` 分支；服务环境为
+`vlm-profile`，测评环境仍为 `embench`。新增 `a-precompute` 模式：A1 独立计算，
+可选的 A2 固定动作 ID 0–161、A4 全部示例各自作为独立组计算。A2 不包含随场景变化的
+动作表标题和 ID≥162 的动态动作。各组不含图片，也不互相关注；A4 内部的示例保持原有
+顺序并作为一个连续序列计算。
+
+正式请求保持 EmbodiedBench 原始 prompt 和 token 顺序不变：第1层完整计算 P/A/B/C，
+第2层起所选 A 段不再计算 hidden state、Q/K/V、Attention query 或 MLP，而是复用预计算
+KV；K 按当前 Qwen3-VL 三维 mRoPE 位置修正，V 直接复用。未选 token、S 和 decode 始终
+正常计算。该路径是近似实验，不保证与完整 prefill 数值等价。
+
+测评包装器在第一条正式推理请求之前自动调用一次 prepare；服务内存中的缓存跨
+episode 使用，并从第一条正式请求开始命中。支持以下四种配置：
+
+```text
+--kv-reuse-a-parts 1       # A1
+--kv-reuse-a-parts 1,2     # A1 + 固定 A2
+--kv-reuse-a-parts 1,4     # A1 + A4
+--kv-reuse-a-parts 1,2,4   # A1 + 固定 A2 + A4
+```
+
+服务和测评命令必须使用相同配置，并固定
+`--kv-recompute-prefix-layers 1`。每个服务生命周期只允许一次 prepare 尝试；更换策略、
+准备文本或重新开始独立实验时需要重启服务，不会自动替换缓存。所选文本、配置或
+`precompute_id` 不一致时返回 HTTP 409，并立即停止测评，避免被当作无效动作反复重试。
+完整启动命令、调用链、日志字段和限制见
+[inference/README.md](inference/README.md#a1a2a4-单次预计算模式)。

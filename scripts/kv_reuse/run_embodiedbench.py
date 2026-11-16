@@ -7,6 +7,7 @@ It intentionally avoids modifying the EmbodiedBench submodule.
 import argparse
 import json
 import os
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -26,14 +27,43 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RUNS_ROOT = (PROJECT_ROOT / "inference" / "kv_reuse" / "runs").resolve()
 
 
+class FatalPrecomputeError(BaseException):
+    """Escape benchmark Exception handlers; main's finally still saves the manifest."""
+
+
+def prepare_once(base_url, model_name, messages, parts, context):
+    text = [part['text'] for message in messages for part in message.get('content', [])
+            if isinstance(part, dict) and part.get('type') == 'text']
+    if len(text) != 1:
+        raise FatalPrecomputeError('prepare requires exactly one prompt text')
+    payload = {'model': model_name, 'text': text[0], 'a_parts': list(parts), 'context': context}
+    request = urllib.request.Request(
+        base_url.rstrip('/') + '/kv-reuse/prepare', data=json.dumps(payload).encode(),
+        headers={'Content-Type': 'application/json'}, method='POST',
+    )
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=300) as response:
+            return json.load(response)
+    except Exception as error:
+        raise FatalPrecomputeError(f'prepare failed: {error}') from error
+
+
+def is_precompute_error(error):
+    body = getattr(error, 'body', None)
+    if not isinstance(body, dict):
+        return False
+    detail = body.get('detail', body)
+    return isinstance(detail, dict) and detail.get('code') == 'kv_precompute_error'
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--benchmark", required=True, choices=("eb-alf", "eb-hab"))
     parser.add_argument("--base-url", default="http://127.0.0.1:8001/v1")
     parser.add_argument("--model-name", default="Qwen/Qwen3-VL-8B-Instruct")
-    parser.add_argument("--kv-mode", choices=("off", "a", "ac", "a-layerwise"), required=True)
+    parser.add_argument("--kv-mode", choices=("off", "a", "ac", "a-layerwise", "a-precompute"), required=True)
     parser.add_argument("--kv-reuse-a-parts", default="",
-                        help="Comma-separated A1-A6 parts for a-layerwise mode")
+                        help="A parts for a-layerwise; a-precompute supports 1, 1,2, 1,4, or 1,2,4")
     parser.add_argument("--kv-recompute-prefix-layers", type=int, default=1)
     parser.add_argument("--episodes", type=int, default=1)
     parser.add_argument("--eval-set", default="base")
@@ -56,13 +86,18 @@ def parse_args():
         )
     except ValueError:
         parser.error("--kv-reuse-a-parts must contain comma-separated integers")
-    if args.kv_mode == "a-layerwise" and not args.kv_reuse_a_parts:
-        parser.error("--kv-reuse-a-parts is required for a-layerwise mode")
-    if args.kv_mode != "a-layerwise" and args.kv_reuse_a_parts:
-        parser.error("--kv-reuse-a-parts is only valid for a-layerwise mode")
+    if args.kv_mode in ("a-layerwise", "a-precompute") and not args.kv_reuse_a_parts:
+        parser.error("--kv-reuse-a-parts is required for this reuse mode")
+    if args.kv_mode not in ("a-layerwise", "a-precompute") and args.kv_reuse_a_parts:
+        parser.error("--kv-reuse-a-parts requires a-layerwise or a-precompute mode")
     if any(part not in range(1, 7) for part in args.kv_reuse_a_parts):
         parser.error("A parts must be integers from 1 through 6")
     args.kv_reuse_a_parts = tuple(sorted(set(args.kv_reuse_a_parts)))
+    if args.kv_mode == 'a-precompute' and (
+        args.kv_reuse_a_parts not in ((1,), (1, 2), (1, 4), (1, 2, 4))
+        or args.kv_recompute_prefix_layers != 1
+    ):
+        parser.error('a-precompute requires 1, 1,2, 1,4, or 1,2,4 and exactly one recomputed layer')
     return args
 
 
@@ -81,6 +116,8 @@ def main():
         prompts.mkdir(exist_ok=True)
     os.environ["remote_url"] = args.base_url
     os.environ.setdefault("OPENAI_API_KEY", "EMPTY")
+    for name in ('NO_PROXY', 'no_proxy'):
+        os.environ[name] = ','.join(filter(None, [os.environ.get(name, ''), '127.0.0.1', 'localhost']))
 
     from omegaconf import OmegaConf
     from embodiedbench.planner.vlm_planner import VLMPlanner
@@ -89,6 +126,8 @@ def main():
     strategy = args.kv_mode
     if args.kv_mode == "a-layerwise":
         strategy = "a" + "".join(str(part) for part in args.kv_reuse_a_parts) + f"_l{args.kv_recompute_prefix_layers}"
+    elif args.kv_mode == 'a-precompute':
+        strategy = 'precompute_a' + ''.join(map(str, args.kv_reuse_a_parts)) + '_l1'
     run_id = f"{args.benchmark}-{args.eval_set}-{strategy}-{timestamp}"
     common = {
         "model_name": args.model_name,
@@ -132,6 +171,7 @@ def main():
     original_act = VLMPlanner.act
     original_process_prompt = VLMPlanner.process_prompt
     call_number = 0
+    prepared = None
 
     def normalized_process_prompt(planner, *prompt_args, **prompt_kwargs):
         # EmbodiedBench emits "Example {i}" on the first planner call but
@@ -169,8 +209,19 @@ def main():
         request_number = 0
 
         def create(**kwargs):
-            nonlocal request_number
+            nonlocal request_number, prepared
             request_number += 1
+            if args.kv_mode == 'a-precompute':
+                if prepared is None:
+                    prepared = prepare_once(args.base_url, args.model_name, kwargs.get('messages', []),
+                                            args.kv_reuse_a_parts, context)
+                    manifest['precompute'] = prepared
+                    (output / 'manifest.json').write_text(
+                        json.dumps(manifest, indent=2, ensure_ascii=False), encoding='utf-8')
+                context['precompute_id'] = prepared['precompute_id']
+            if request_number == 1:
+                with (output / "calls.jsonl").open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(context, ensure_ascii=False) + "\n")
             kwargs["extra_body"] = {**kwargs.get("extra_body", {}), "kv_reuse_context": context}
             if args.save_prompts:
                 text = []
@@ -185,11 +236,14 @@ def main():
                     f"_request_{request_number}.txt"
                 )
                 (prompts / name).write_text("\n\n".join(text), encoding="utf-8")
-            return original_create(**kwargs)
+            try:
+                return original_create(**kwargs)
+            except Exception as error:
+                if is_precompute_error(error):
+                    raise FatalPrecomputeError(str(error)) from error
+                raise
 
         completions.create = create
-        with (output / "calls.jsonl").open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(context, ensure_ascii=False) + "\n")
         try:
             return original_act(planner, observation, instruction)
         finally:
@@ -209,6 +263,7 @@ def main():
         "config": OmegaConf.to_container(config),
         "calls_file": str(output / "calls.jsonl"),
         "server_metrics_file": str(output / "server_metrics.jsonl"),
+        "precompute_metrics_file": str(output / "precompute_metrics.jsonl") if args.kv_mode == 'a-precompute' else None,
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
     try:
