@@ -1,1 +1,4 @@
 profiles/
+# KV reuse experiment outputs retained across branch switches.
+/inference/kv_reuse/runs/
+/scripts/kv_reuse/__pycache__/
