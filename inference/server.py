@@ -1,4 +1,4 @@
-"""Single-request Transformers VLM service for EmbodiedBench (no LMDeploy)."""
+"""Serialized Transformers generation and LoTa-Bench candidate scoring service."""
 import argparse
 import importlib.metadata
 import json
@@ -16,6 +16,11 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 from xgrammar.contrib.hf import LogitsProcessor
 
+try:
+    from .candidate_scoring import score_candidates
+except ImportError:
+    from candidate_scoring import score_candidates
+
 app = FastAPI(title="vlm-planning Transformers service")
 lock = threading.Lock()
 model = processor = args = grammar_compiler = None
@@ -29,7 +34,8 @@ def health():
                 transformers_version=transformers.__version__,
                 xgrammar_version=importlib.metadata.version('xgrammar'),
                 dtype=args.dtype, attention='sdpa',
-                schema_mode='xgrammar+jsonschema-validation')
+                schema_mode='xgrammar+jsonschema-validation',
+                capabilities=['chat_completions', 'score_candidates'])
 
 
 @app.get('/v1/models')
@@ -97,6 +103,34 @@ def validate_structured_output(text, validator):
     except ValidationError as error:
         raise HTTPException(500, f'Model output failed JSON schema validation: {error.message}',
                             headers={'x-should-retry': 'false'}) from error
+
+
+@app.post('/v1/score_candidates')
+def score_candidate_request(request: dict):
+    if request.get('model') != args.model_name:
+        raise HTTPException(404, 'Model name does not match /v1/models')
+    messages = request.get('messages')
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(400, 'messages must be a nonempty list')
+    request_id = 'score-' + uuid.uuid4().hex
+    try:
+        converted = convert_messages(messages)
+        with lock:
+            result = score_candidates(
+                model, processor, converted, request.get('candidates'),
+                request.get('score_function', 'sum'), request.get('candidate_batch_size', 8),
+                args.max_context)
+    except (ValueError, TypeError, KeyError) as error:
+        raise HTTPException(400, str(error), headers={'x-should-retry': 'false'}) from error
+    except torch.cuda.OutOfMemoryError as error:
+        raise HTTPException(500, 'Candidate scoring ran out of GPU memory; reduce candidate_batch_size',
+                            headers={'x-should-retry': 'false'}) from error
+    result.update(id=request_id, model=args.model_name,
+                  metadata=request.get('metadata', {}))
+    print(json.dumps({'request_id': request_id, 'kind': 'candidate_scoring',
+                      'metadata': result['metadata'], 'usage': result['usage'],
+                      'best_index': result['best_index'], 'timing': result['server_timing']}), flush=True)
+    return result
 
 
 @app.post('/v1/chat/completions')

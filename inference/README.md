@@ -22,7 +22,6 @@ third_party/transformers 中的模型与生成代码
 
 顶层仓库和 `third_party/transformers` 是两个独立 Git 仓库。当前 `master`
 记录固定的 Transformers 子模块提交；子模块处于 detached HEAD 是正常现象。
-`vlm-profile` Conda 环境只保存运行依赖，不纳入 Git。
 
 ## 服务行为
 
@@ -59,5 +58,39 @@ schema 无效或输出未通过校验时，服务返回 HTTP 500，并通过
 [vlm_image.py](../scripts/smoke/vlm_image.py) 会在内存中生成一张红色图片并请求服务，
 响应只打印到终端，不会创建结果文件。运行方法见根 README。
 
-当前服务只适配 Qwen3-VL，不支持 streaming、batching、beam search 或 tool calling。
+当前生成接口只适配 Qwen3-VL，不支持 streaming、请求batching、beam search 或 tool calling。
 `finish_reason=length` 表示达到输出 token 上限，遇到 EOS 时返回 `stop`。
+
+## LoTa-Bench 图文候选动作评分
+
+使用本仓库的 `lotabench-vlm` 分支和 LoTa-Bench 的 `qwen3-vl` 分支。
+需已准备好 ALFRED JSON(lota-bench仓库下载数据集) 及 X display `1`。
+
+终端一：启动 Qwen3-VL-8B BF16 服务。
+
+```bash
+conda activate vlm-profile
+cd /data/home/x_long32/workspace/tapeout_2027/vlm-planning
+HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/third_party/transformers/src" \
+  python inference/server.py \
+  --model-path /data/home/x_long32/workspace/models/Qwen3-VL-8B-Instruct \
+  --model-name Qwen/Qwen3-VL-8B-Instruct --dtype bfloat16 --port 8011
+```
+
+终端二：服务就绪后，测评 ALFRED `valid_seen` 前 50 个条目。
+
+```bash
+conda activate lotabench
+cd /data/home/x_long32/workspace/tapeout_2027/LoTa-Bench
+OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 HF_HUB_OFFLINE=1 PYTHONHASHSEED=0 \
+  python src/evaluate.py --config-name=config_alfred_qwen3_vl \
+  alfred.eval_set=valid_seen alfred.max_episodes=50
+```
+
+测试未见场景时，将 `alfred.eval_set` 改为 `valid_unseen`；数量由 `alfred.max_episodes` 指定。
+默认使用语义 Top-6 示例、动作失败反馈和每批 8 个候选评分。
+SentenceTransformer 编码进程自动使用 `vlm-profile` 环境，避开模型服务占用的 GPU，
+编码后在 CPU 保存向量并计算相似度。
+
+结果保存在 LoTa-Bench 的 `outputs/alfred/日期_时间/`：`summary.json` 为成功率汇总，
+`calls/` 保存逐次调用的文本、图片和候选分数。
